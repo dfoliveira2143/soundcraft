@@ -1,5 +1,17 @@
 # SoundCraft — instructions for agents
 
+## Validacao documental e confirmacao para testes
+
+- Esta politica e obrigatoria e prevalece sobre orientacoes conflitantes de validacao automatica ou autonomia neste arquivo, em CLAUDE.md, planos e demais referencias. Preserva as regras de organizacao dos commits, branch e autorizacao de push.
+- A excecao vale somente para commits exclusivamente documentais: README.md, CLAUDE.md, AGENTS.md, instrucoes para agentes e documentos de orientacao, planejamento ou referencia que nao sejam usados na execucao, compilacao, empacotamento ou testes do projeto. A extensao do arquivo, por si so, nao determina a elegibilidade.
+- Nesses commits, nao execute suite de testes, compilacao, lint de codigo ou CI completo. Revise o diff, execute `git diff --check`, confira os links locais e a coerencia das instrucoes alteradas. Informe na entrega que a validacao completa foi dispensada por se tratar de alteracao exclusivamente documental.
+- A excecao nao abrange codigo, dependencias, configuracoes, scripts, workflows, assets usados pelo produto, documentacao executavel nem arquivos consumidos pelo aplicativo ou pelo build. Commits que misturem documentacao com essas alteracoes continuam sujeitos as validacoes aplicaveis.
+- Antes de iniciar testes ou validacoes de codigo, explique ao usuario quais verificacoes pretende executar, por que sao necessarias e seu alcance. Informe se podem exigir compilacao demorada, sem inventar estimativas. Pergunte se deseja continuar e aguarde confirmacao explicita; pedidos para alterar arquivos ou criar commits nao autorizam essas execucoes automaticamente.
+- Nao repita a pergunta para a mesma execucao ja autorizada. Peca nova confirmacao se precisar ampliar significativamente o escopo.
+- Se o usuario nao autorizar, preserve as alteracoes e informe quais verificacoes ficaram pendentes. Nao crie commits que exijam essas verificacoes sem uma dispensa explicita do usuario.
+- Durante execucoes longas, comunique avancos relevantes, falhas ou bloqueios, sem mensagens repetitivas de espera.
+- Revisao do diff, `git diff --check` e conferencia de links locais podem ser feitas sem confirmacao.
+
 SoundCraft is a clean-room, open-source, pure-Rust digital audio workstation targeting Avid Pro Tools parity — and superiority (speed, openness, agent control). It runs natively on macOS, Windows, Linux and FreeBSD, and on the web via WASM. Siblings with the same conventions: `../photocraft` (Photoshop), `../vectorcraft` (Illustrator), `../filmcraft` (Premiere), `../lightcraft` (Lightroom), `../pdfcraft` (Acrobat), `../effectcraft` (After Effects), `../designcraft` (InDesign).
 
 Standards and learnings shared across the crafting apps live in `../../craftrules` (checked out next to the craft-apps folder, or `storytold/craftrules`). Read its `AGENTS.md` at the start of a session, follow its standards, and contribute reusable learnings back there. Never code: repos don't share code.
@@ -7,7 +19,7 @@ Standards and learnings shared across the crafting apps live in `../../craftrule
 ## Start every session here
 1. Read `plan/STATUS.md` (current milestone, next task) and `plan/execution-plan.md`. `plan/` is gitignored (local only). Behaviour reference: `plan/protools/` (observed menu tree `menus-clean.txt` and screenshots; never committed).
 2. Read `ROADMAP.md` (committed) for stage, status and the parity numbers; pick work from `docs/gaps.md`. The progress docs follow craftrules `standards/progress-docs.md`: `docs/target-app-parity.md` (assessment), `docs/gaps.md`, `docs/roadmap.md`, `docs/ui-parity.md`, `docs/file-format-parity.md`, `docs/hardware-parity.md`, `docs/plugin-parity.md`, `docs/localization-parity.md`; `docs/parity-checklist.md` is generated. Update their timestamps and revision history when you change them.
-3. Work autonomously; don't stop to ask unless a decision is genuinely the user's.
+3. Work autonomously; Ask for explicit user confirmation before tests or code validation as required by AGENTS.md; otherwise follow the autonomy protocol.
 
 ## ⚠️ Assets: the absolute rule
 **No Avid, Pro Tools, Adobe or other proprietary iconography, images, sounds, presets or artwork — ever.** This is not negotiable.
@@ -63,7 +75,7 @@ Parity is measured, not guessed: `crates/engine/catalog/menus.txt` lists the inc
 - Shell gotcha: `mv`/`cp` are aliased interactive here — use `/bin/mv -f` / `/bin/cp -f`.
 - Parallel agents: separate `CARGO_TARGET_DIR` per agent; edit only the crates you own; write manifests atomically; delete your target dir when done (disk).
 
-## Quality gates (before every commit)
+## Quality gates (before commits requiring code validation (subject to the documentation exception and explicit user confirmation in AGENTS.md))
 `cargo xtask ci` = fmt check, `clippy --workspace --all-targets -D warnings`, tests, assets, layers, wasm check. Commit after each arc of work that builds; one topic per commit.
 
 ## Release
