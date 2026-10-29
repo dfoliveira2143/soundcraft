@@ -42,3 +42,5 @@ Os guias são mapas de navegação, não novas cópias dos contratos técnicos. 
 - [Releasing SoundCraft](releasing.md)
 - [Ordinary strip mute automation](strip-mute-automation.md)
 - [UI parity](ui-parity.md)
+
+- [Creative Workshop: origem, identidade e publicação](branding.md)
