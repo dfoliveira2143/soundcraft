@@ -59,7 +59,7 @@ fn search_chord(m: Modifiers, mac: bool) -> bool {
 pub fn handle(app: &mut SoundApp, ctx: &egui::Context) {
     // Cmd+= and Cmd+0 are Mix/Edit and Quantize to Grid, not egui's built-in interface zoom.
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
-    if ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() {
+    if ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() || app.ui.show_preferences {
         return;
     }
     // A scripted press is identified by its exact position in this pass's events, not by matching
@@ -177,6 +177,14 @@ fn fixed(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
             let _ = app.run("edit.tool", json!({"tool": tool}));
             true
         }
+        _ => fixed_more(app, key, m, mac),
+    }
+}
+
+/// The rest of [`fixed`]'s keys.
+fn fixed_more(app: &mut SoundApp, key: Key, m: Modifiers, mac: bool) -> bool {
+    let plain = !m.command && !m.alt && !m.ctrl && !m.shift;
+    match key {
         // `=` is what a bare press of the unlabeled +/- key reports (it has no shift held, so it
         // can never be `Key::Plus`); `Key::Plus` is kept for a keyboard that does send it (e.g. a
         // numpad +). `!m.alt` leaves Alt+= to `window.event_list`'s registered shortcut.
