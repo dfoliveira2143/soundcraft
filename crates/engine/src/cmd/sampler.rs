@@ -75,7 +75,7 @@ pub(crate) fn attach(e: &mut Engine, t: TrackId, name: &str, bytes: &[u8], path:
         return Err(EngineError::Io(format!("{name}: no audio")));
     }
     let buf = crate::io::at_rate(buf, e.session().sample_rate.hz(), MAX_SAMPLE_VALUES)
-        .ok_or_else(|| EngineError::Io(format!("{name}: too long for a sample (ten minutes of 192 kHz stereo at most)")))?;
+        .map_err(|r| EngineError::Io(format!("{name}: {}", r.message("too long for a sample (ten minutes of 192 kHz stereo at most)"))))?;
     let channels = buf.num_channels();
     let s = e.session_mut();
     let src = crate::io::add_source(s, name, buf, path, format.format);
@@ -232,7 +232,8 @@ mod tests {
         let buf = AudioBuffer { sample_rate: 96_000, channels: vec![tone.clone(), tone] };
         let mut e = Engine::default();
         let t = instrument_track(&mut e);
-        for (ext, format) in [("flac", FileFormat::Flac), ("aif", FileFormat::Aiff)] {
+        for format in [FileFormat::Flac, FileFormat::Aiff] {
+            let ext = format.default_extension();
             let path = d.join(format!("tone.{ext}"));
             let opts = EncodeOptions { format, bit_depth: BitDepth::Int24, dither: false, bwf: None };
             std::fs::write(&path, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
