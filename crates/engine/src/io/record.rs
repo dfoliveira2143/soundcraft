@@ -1,7 +1,7 @@
 use super::import::add_source;
 #[cfg(test)]
 use super::session::{save_copy, save_session};
-use super::*;
+use super::{Clip, Engine, EngineError, FileFormat, OsStr, PathBuf, Range, Samples, TrackId, read_file};
 
 /// A recording's plan, made when it starts: each record-enabled track's take file, where the
 /// takes start on the timeline, the loop length they split into when loop recording, and the
@@ -48,8 +48,7 @@ fn add_recording_in(
     let before = e.session_arc();
     let mut out = Vec::new();
     for (tid, path) in takes {
-        let read =
-            read_file(&path).and_then(|b| soundcraft_audio_io::decode(&b, None).map_err(|err| EngineError::Io(format!("{}: {err}", path.display()))));
+        let read = read_file(&path).and_then(|b| craft_audio::decode(&b, None).map_err(|err| EngineError::Io(format!("{}: {err}", path.display()))));
         let Ok((_, buf)) = read.inspect_err(|err| e.message(err.to_string())) else { continue };
         let s = e.session_mut();
         if s.track(tid).is_none() {
@@ -117,6 +116,7 @@ pub fn live_span(start: Samples, pass: Option<Samples>, punch: Option<Range>, le
 
 #[cfg(test)]
 mod record_tests {
+    use super::super::{AudioBuffer, Path, plan_takes};
     use super::*;
     use serde_json::json;
 
@@ -128,7 +128,7 @@ mod record_tests {
     }
 
     fn write_take(path: &Path, frames: usize) {
-        let mut bytes = soundcraft_audio_io::wav_float_header(1, 48_000, frames as u64).unwrap();
+        let mut bytes = craft_audio::wav_float_header(48_000, 1, frames as u64).unwrap();
         bytes.extend((0..frames).flat_map(|i| (i as f32 / frames as f32 - 0.5).to_le_bytes()));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();

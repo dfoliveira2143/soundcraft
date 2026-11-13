@@ -1,6 +1,6 @@
 use super::audio::feed_meter;
 use super::plugins::failed_plugin_status;
-use super::*;
+use super::{Gesture, MainWindow, MeterDisplay, Range, Samples, SoundApp, TrackId, TransportRequest, json};
 
 /// Whether another automation-write pass is due: the transport moved at least
 /// `step` since `last` in either direction. `last == i64::MIN` marks "never
@@ -155,15 +155,23 @@ impl SoundApp {
     /// autosave folder. Returns the takes it records.
     fn arm_recorder(&mut self) -> Result<Vec<soundcraft_engine::io::Take>, String> {
         let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
-        let unsaved_dir = self.autosave_dir.as_ref().map_or_else(std::env::temp_dir, |d| d.join(name));
+        // Without a settings folder the takes go under the temporary folder, in a folder of this
+        // run's own that nobody else could have made first.
+        let unsaved_dir = match &self.autosave_dir {
+            Some(d) => d.join(name),
+            // A saved session records beside its file: `plan_takes` never uses this folder.
+            None if self.engine.path.is_some() => std::path::PathBuf::new(),
+            None => self.fallback_take_dir()?,
+        };
         let Some(r) = &mut self.recorder else { return Err("no audio input device".into()) };
         let plan = soundcraft_engine::io::plan_takes(&self.engine, &unsaved_dir, r.channels);
         if plan.is_empty() {
             return Err("no audio track is record-enabled".into());
         }
-        // The takes are unsaved work: the folder they go into under the autosave root is
-        // owner-only, like the autosaves, before the recorder makes anything in it.
-        if self.engine.path.is_none() && self.autosave_dir.is_some() {
+        // The takes are unsaved work: on Unix the folder they go into is owner-only, like the
+        // autosaves, before the recorder makes anything in it (other systems get the folder's
+        // inherited access: no ACLs are set, so the temporary folder's own per-user access applies).
+        if self.engine.path.is_none() {
             for dir in plan.iter().filter_map(|(_, _, path)| path.parent()) {
                 soundcraft_engine::autosave::create_folder(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             }
@@ -174,6 +182,19 @@ impl SoundApp {
             .collect();
         r.arm(plan)?;
         Ok(takes)
+    }
+
+    /// The folder for the takes of a session never saved when there is no autosave folder, made on
+    /// first use: exclusively and under a name nobody can guess, so another account cannot have
+    /// made it first, with open permissions or as a link.
+    fn fallback_take_dir(&mut self) -> Result<std::path::PathBuf, String> {
+        if let Some(dir) = &self.fallback_take_dir {
+            return Ok(dir.clone());
+        }
+        let dir = soundcraft_engine::autosave::create_unique_folder(&std::env::temp_dir(), "SoundCraft")
+            .map_err(|e| format!("temporary take folder: {e}"))?;
+        self.fallback_take_dir = Some(dir.clone());
+        Ok(dir)
     }
 
     fn finish_recording(&mut self) {
@@ -204,7 +225,8 @@ impl SoundApp {
     }
 
     /// While playing, record volume automation from fader positions for tracks in Write mode, and
-    /// for Touch/Latch tracks whose fader is (or, for Latch, was) being moved. Each point replaces the
+    /// for Touch/Latch tracks whose fader is (or, for Latch, was) being moved. Send levels follow the
+    /// same rules, per send, from its slot or its floating send window. Each point replaces the
     /// automation since the previous one, and Stop writes a last point. A pass and whatever is
     /// dragged during it, its fader included, are one undo step.
     pub(crate) fn write_automation(&mut self) {
@@ -214,7 +236,7 @@ impl SoundApp {
         let may_write =
             playing && self.engine.session().tracks.iter().any(|t| matches!(t.mixer.automation_mode, M::Write | M::Touch | M::Latch | M::TouchLatch));
         self.engine.hold_merge(may_write.then_some(PASS));
-        if !playing && self.touched.is_empty() {
+        if !playing && self.touched.is_empty() && self.touched_sends.is_empty() {
             self.last_write_at = i64::MIN;
             return;
         }
@@ -228,6 +250,10 @@ impl SoundApp {
         let dragging = self.pointer_down;
         let fader_track = match &self.gesture {
             Some(Gesture::Fader { track, .. }) => Some(*track),
+            _ => None,
+        };
+        let send_fader = match &self.gesture {
+            Some(Gesture::SendFader { track, slot }) => Some((*track, *slot)),
             _ => None,
         };
         let writes: Vec<(TrackId, f32)> = self
@@ -247,9 +273,39 @@ impl SoundApp {
                 write.then_some((t.id, t.mixer.volume_db))
             })
             .collect();
-        for (t, v) in writes {
+        let send_writes: Vec<(TrackId, usize, f32)> = self
+            .engine
+            .session()
+            .tracks
+            .iter()
+            .flat_map(|t| {
+                let m = t.mixer.automation_mode;
+                t.mixer.sends.iter().enumerate().filter_map(move |(slot, s)| s.as_ref().map(|s| (t.id, m, slot, s.level_db)))
+            })
+            .filter(|&(t, m, slot, _)| {
+                let touched_now = dragging && send_fader == Some((t, slot));
+                match m {
+                    M::Write => true,
+                    M::Touch => touched_now,
+                    M::Latch | M::TouchLatch => touched_now || self.touched_sends.contains(&(t, slot)),
+                    _ => false,
+                }
+            })
+            .map(|(t, _, slot, db)| (t, slot, db))
+            .collect();
+        let points: Vec<(TrackId, String, f32)> = writes
+            .iter()
+            .map(|&(t, v)| (t, "volume".to_string(), v))
+            .chain(send_writes.iter().map(|&(t, slot, v)| (t, format!("send_{}_level", (b'a' + slot as u8) as char), v)))
+            .collect();
+        for &(t, _) in &writes {
             self.touched.insert(t);
-            let mut point = serde_json::json!({"track": t.0, "param": "volume", "at": pos, "value": v});
+        }
+        for &(t, slot, _) in &send_writes {
+            self.touched_sends.insert((t, slot));
+        }
+        for (t, param, v) in points {
+            let mut point = serde_json::json!({"track": t.0, "param": param, "at": pos, "value": v});
             if from != i64::MIN {
                 point["from"] = from.into();
             }
@@ -257,6 +313,7 @@ impl SoundApp {
         }
         if !playing {
             self.touched.clear();
+            self.touched_sends.clear();
             self.engine.end_merge();
         }
     }
@@ -296,6 +353,7 @@ impl SoundApp {
                     self.punch = None;
                     self.gesture = None;
                     self.touched.clear();
+                    self.touched_sends.clear();
                     self.last_write_at = i64::MIN;
                     self.edit_layout.follow_hold = false;
                     self.meters.clear();
@@ -304,6 +362,21 @@ impl SoundApp {
                 TransportRequest::Play => {
                     if !self.is_playing() {
                         self.play_from_selection();
+                    }
+                }
+                TransportRequest::PlayFrom(at) => {
+                    if self.is_playing() {
+                        // Playing on from `at` drops the end and loop of the earlier selection.
+                        if let Some(p) = &self.player {
+                            p.play(at, None, None);
+                        }
+                        if let Some(sim) = &mut self.sim {
+                            *sim = (at, None, None);
+                        }
+                        self.last_write_at = i64::MIN;
+                        self.engine.transport.position = at;
+                    } else {
+                        self.start_play(at, None, None);
                     }
                 }
                 TransportRequest::Stop | TransportRequest::Pause => self.stop_play(),
@@ -399,5 +472,20 @@ impl SoundApp {
             }
             feed_meter(&mut self.main_meter, [0.0, 0.0], 0.0, dt);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fallback_take_folder_is_made_once_under_the_temporary_folder() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+        let a = app.fallback_take_dir().unwrap();
+        assert_eq!(a.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(a.is_dir());
+        assert_eq!(app.fallback_take_dir().unwrap(), a, "the same folder for the rest of the run");
+        let _ = std::fs::remove_dir_all(&a);
     }
 }

@@ -4,7 +4,7 @@ use crate::SoundApp;
 use crate::theme::{Tokens, mono, rgb};
 use egui::{Color32, Sense, vec2};
 use serde_json::{Value, json};
-use soundcraft_model::{AutomationMode, ClipContent};
+use soundcraft_model::{AutomationMode, ClipContent, SESSION_EXTENSION};
 use soundcraft_playback::AudioConfig;
 use soundcraft_playback::devices::{AudioSystem, DeviceInfo};
 use std::sync::Arc;
@@ -334,38 +334,40 @@ fn workspace(app: &mut SoundApp, ctx: &egui::Context) {
             ui.label(egui::RichText::new(&dir).small());
         });
         ui.separator();
-        let mut entries: Vec<(String, bool)> = std::fs::read_dir(&dir)
+        // Names stay paths: a name that is not valid Unicode is shown lossily, and opening it says so.
+        let mut entries: Vec<(std::path::PathBuf, String, bool)> = std::fs::read_dir(&dir)
             .map(|rd| {
                 rd.flatten()
                     .filter_map(|e| {
+                        let path = e.path();
                         let name = e.file_name().to_string_lossy().into_owned();
                         if name.starts_with('.') {
                             return None;
                         }
                         let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-                        let ext = std::path::Path::new(&name).extension().and_then(std::ffi::OsStr::to_str).unwrap_or("").to_ascii_lowercase();
-                        (is_dir || ["wav", "aif", "aiff", "flac", "mp3", "ogg", "m4a", "m4b", "caf", "mid", "midi", "scraft"].contains(&ext.as_str()))
-                            .then_some((name, is_dir))
+                        let ext = path.extension().and_then(std::ffi::OsStr::to_str).unwrap_or("").to_ascii_lowercase();
+                        (is_dir
+                            || craft_audio::DECODE_EXTENSIONS.contains(&ext.as_str())
+                            || ["mid", "midi", SESSION_EXTENSION].contains(&ext.as_str()))
+                        .then_some((path, name, is_dir))
                     })
                     .collect()
             })
             .unwrap_or_default();
-        entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (name, is_dir) in entries.into_iter().take(2000) {
-                let path = std::path::Path::new(&dir).join(&name).to_string_lossy().into_owned();
+            for (path, name, is_dir) in entries.into_iter().take(2000) {
                 let label = if is_dir { format!("📁 {name}") } else { format!("🔊 {name}") };
                 let r = ui.selectable_label(false, label);
                 if r.double_clicked() {
                     if is_dir {
-                        app.ui.workspace_dir = path;
-                    } else if name.ends_with(".scraft") {
-                        let _ = crate::dialogs::run_or_ask(app, "session.open", json!({"path": path}));
-                    } else if name.ends_with(".mid") || name.ends_with(".midi") {
-                        let _ = app.run("file.import_midi", json!({"path": path}));
+                        // The folder is kept as text in the preferences.
+                        match crate::dialogs::unicode(&path) {
+                            Ok(p) => app.ui.workspace_dir = p.to_owned(),
+                            Err(e) => app.ui.status = e.to_string(),
+                        }
                     } else {
-                        let at = app.engine.session().edit.selection.start;
-                        crate::import::start(app, json!({"path": path, "at": at}));
+                        crate::dialogs::open_path(app, &path);
                     }
                 }
             }
@@ -407,7 +409,7 @@ fn configurations(app: &mut SoundApp, ctx: &egui::Context) {
     app.ui.show_configurations = open;
 }
 
-/// Restore a saved window configuration, keeping the configuration list and the appearance.
+/// Restore a window layout while retaining current application preferences and any open draft.
 /// A configuration saved before the current panel layouts gets the default layouts.
 pub fn recall_configuration(app: &mut SoundApp, saved: &Value) -> Result<(), String> {
     let mut saved = saved.clone();
@@ -416,8 +418,14 @@ pub fn recall_configuration(app: &mut SoundApp, saved: &Value) -> Result<(), Str
     crate::docking::validate(&st.docking).and_then(|()| crate::docking::validate_mix(&st.mix_docking))?;
     st.configurations = app.ui.configurations.clone();
     st.theme = app.ui.theme;
+    st.show_preferences = app.ui.show_preferences;
+    st.preferences_page = app.ui.preferences_page;
+    st.preferences_window_pos = app.ui.preferences_window_pos;
+    st.reduce_visual_effects = app.ui.reduce_visual_effects;
+    st.undo_levels = app.ui.undo_levels.clamp(1, 64);
     st.show_configurations = true;
     crate::docking::cancel_replaced_state(app, &st);
+    app.engine.set_history_limit(st.undo_levels);
     app.ui = st;
     Ok(())
 }
@@ -516,6 +524,8 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             number_combo(ui, "pe-rate", "Sample rate", &mut draft.sample_rate, out.map_or(&[][..], |d| &d.sample_rates), "Hz");
             ui.end_row();
             ui.label("Buffer size");
+            // The combo lists standard power-of-two sizes. `setup.playback_engine` does not round
+            // onto this list: it keeps any integer 16..=8192, the same as `ui.audio_device`.
             let buffers = out.map(DeviceInfo::buffer_sizes).unwrap_or_else(|| soundcraft_playback::devices::STANDARD_BUFFERS.to_vec());
             number_combo(ui, "pe-buffer", "Buffer size", &mut draft.buffer_size, &buffers, "samples");
             ui.end_row();
@@ -620,6 +630,53 @@ pub fn audio_device_command(app: &mut SoundApp, p: &serde_json::Value) -> Result
         out["systems"] = json!(soundcraft_playback::devices::audio_systems());
     }
     Ok(out)
+}
+
+/// Programmatic `setup.playback_engine` / `setup.hardware`. `device` is the output name and
+/// `buffer_size` is any integer 16..=8192 or null (not rounded to the window's power-of-two list);
+/// both go through [`audio_device_command`]. Delay compensation still goes through the engine
+/// command, and only after the device change has been accepted. The result is the open device:
+/// its name, the buffer actually in use (`device_buffer`, null for the device default), its sample
+/// rate, and delay compensation. `applied` is true only when an audio device is open.
+pub fn setup_audio_command(app: &mut SoundApp, id: &str, p: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::Value;
+    let mut audio = serde_json::Map::new();
+    if let Some(device) = p.get("device") {
+        if !device.is_null() && !device.is_string() {
+            return Err("`device` must be a string or null".into());
+        }
+        audio.insert("output".to_string(), device.clone());
+    }
+    if let Some(buffer) = p.get("buffer_size") {
+        audio.insert("buffer_size".to_string(), buffer.clone());
+    }
+    if !audio.is_empty() {
+        audio_device_command(app, &Value::Object(audio))?;
+    }
+    if id == "setup.playback_engine"
+        && let Some(on) = p.get("delay_compensation").and_then(Value::as_bool)
+    {
+        app.engine.execute("setup.playback_engine", &json!({"delay_compensation": on})).map_err(|e| e.to_string())?;
+    }
+    let applied = app.player.as_ref().is_some_and(|player| !player.silent);
+    let (device, buffer_size, sample_rate) = match app.player.as_ref() {
+        Some(player) => {
+            let buffer = match player.device_buffer {
+                Some(n) => json!(n),
+                None => Value::Null,
+            };
+            (json!(player.device_name), buffer, json!(player.device_rate))
+        }
+        None => (Value::Null, Value::Null, json!(app.engine.session().sample_rate.hz())),
+    };
+    Ok(json!({
+        "applied": applied,
+        "device": device,
+        "buffer_size": buffer_size,
+        "sample_rate": sample_rate,
+        "bit_depth": app.engine.session().bit_depth,
+        "delay_compensation": app.engine.session().edit.delay_compensation,
+    }))
 }
 
 /// Setup › I/O: busses and output paths.
@@ -734,7 +791,13 @@ pub fn clip_effects(app: &mut SoundApp, ctx: &egui::Context) {
                         let key = format!("{prefix}{}", p.id);
                         let mut v = get(app, &key, p.default);
                         let before = v;
-                        col.add(egui::Slider::new(&mut v, p.min..=p.max).text(p.name));
+                        let mut wide = f64::from(v);
+                        crate::widgets::FineSlider::new(&mut wide, f64::from(p.min)..=f64::from(p.max))
+                            .text(p.name)
+                            .logarithmic(p.taper == soundcraft_dsp::Taper::Log && p.min > 0.0)
+                            .default_value(f64::from(p.default))
+                            .show(col);
+                        v = wide as f32;
                         if (v - before).abs() > f32::EPSILON {
                             let mut m = serde_json::Map::new();
                             m.insert(key.clone(), json!(v));
@@ -749,7 +812,9 @@ pub fn clip_effects(app: &mut SoundApp, ctx: &egui::Context) {
             });
             let mut g = get(app, "gain", 0.0);
             let before = g;
-            ui.add(egui::Slider::new(&mut g, -36.0..=24.0).text("Clip effects gain (dB)"));
+            let mut wide = f64::from(g);
+            crate::widgets::FineSlider::new(&mut wide, -36.0..=24.0).text("Clip effects gain (dB)").default_value(0.0).show(ui);
+            g = wide as f32;
             if (g - before).abs() > f32::EPSILON {
                 let _ =
                     app.engine.execute_merged("clip.effects_set", &json!({"clips": [cid.0], "params": {"gain": g}}), &format!("cfx:{}:gain", cid.0));
