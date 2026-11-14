@@ -69,6 +69,50 @@ fn is_black(p: i32) -> bool {
 }
 
 /// Draw the MIDI editor for the target clip, with an empty-state prompt that adds a clip on the selected MIDI track.
+/// The piano roll's geometry: where it is drawn and how ticks and pitches map onto it.
+#[derive(Clone, Copy)]
+struct Roll<'a> {
+    sequence: &'a soundcraft_midi::Sequence,
+    roll: Rect,
+    keys: Rect,
+    vel: Rect,
+    px_per_tick: f32,
+    len_ticks: i64,
+    scroll: f32,
+    grid_ticks: i64,
+    rows: i32,
+}
+
+impl Roll<'_> {
+    fn x_of(&self, tick: i64) -> f32 {
+        self.roll.min.x + tick as f32 * self.px_per_tick
+    }
+
+    fn y_of(&self, pitch: i32) -> f32 {
+        self.roll.min.y + (127 - pitch) as f32 * ROW_H - self.scroll
+    }
+
+    fn pitch_at(&self, y: f32) -> i32 {
+        127 - ((y - self.roll.min.y + self.scroll) / ROW_H).floor() as i32
+    }
+
+    /// The note under `pos` and whether `pos` is on its resize edge.
+    fn hit(&self, pos: egui::Pos2) -> Option<(usize, bool)> {
+        self.sequence.notes.iter().enumerate().rev().find_map(|(i, n)| {
+            let r = Rect::from_min_max(
+                pos2(self.x_of(n.start), self.y_of(i32::from(n.pitch))),
+                pos2(self.x_of(n.start + n.length).max(self.x_of(n.start) + 3.0), self.y_of(i32::from(n.pitch)) + ROW_H),
+            );
+            r.contains(pos).then_some((i, pos.x > r.max.x - 5.0))
+        })
+    }
+
+    /// `tk` ticks, rounded to the grid.
+    fn snap(&self, tk: f32) -> i64 {
+        ((tk / self.grid_ticks as f32).round() as i64) * self.grid_ticks
+    }
+}
+
 pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     // Painter-only contents do not advance the layout. Claim the resized
     // space, including the empty state, so the dock keeps its chosen height.
@@ -80,24 +124,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     ui.painter().rect_filled(header, 0.0, t.panel_bg2);
     ui.painter().text(pos2(header.min.x + 8.0, header.center().y), Align2::LEFT_CENTER, "MIDI EDITOR", bold(11.5), t.header_text);
     let Some(cid) = target_clip(app) else {
-        let track = {
-            let s = app.engine.session();
-            s.tracks.iter().find(|t| t.kind.is_midi() && s.edit.selected_tracks.contains(&t.id)).map(|t| (t.id, t.name.clone()))
-        };
-        let msg = match &track {
-            Some((_, name)) => format!("Click to add a MIDI clip to {name} at the insertion point."),
-            None => "Select a MIDI clip (or a MIDI track) to edit its notes.".into(),
-        };
-        ui.painter().text(full.center(), Align2::CENTER_CENTER, msg, regular(13.0), t.text_dim);
-        let body = Rect::from_min_max(pos2(full.min.x, header.max.y), full.max);
-        if let Some((id, _)) = track
-            && ui.interact(body, ui.scope_id().with("new_clip"), Sense::click()).clicked()
-        {
-            let sel = app.engine.session().edit.selection;
-            if let Ok(v) = app.run("midi.new_clip", json!({"track": id.0, "start": sel.start, "end": sel.end})) {
-                let _ = app.run("edit.select", json!({"clips": [v["clip"]]}));
-            }
-        }
+        empty_state(app, ui, full, header);
         return;
     };
     let Some((track, clip)) = app.engine.session().find_clip(cid).map(|(t, c)| (t, c.clone())) else { return };
@@ -115,40 +142,8 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         regular(11.0),
         t.text_dim,
     );
-    let grid_ticks = match app.engine.session().edit.grid {
-        soundcraft_time::GridValue::Note { value, dotted, triplet } => {
-            let mut g = value.ticks();
-            if dotted {
-                g = g * 3 / 2;
-            }
-            if triplet {
-                g = g * 2 / 3;
-            }
-            g.max(1)
-        }
-        _ => TICKS_PER_QUARTER / 4,
-    };
-    // Header toolbar: whole-clip MIDI operations.
-    let bar = Rect::from_min_max(pos2(header.max.x - 330.0, header.min.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0));
-    let mut tb = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)));
-    tb.spacing_mut().item_spacing.x = 4.0;
-    let mut op: Option<(&str, serde_json::Value)> = None;
-    if tb.small_button("Legato").clicked() {
-        op = Some(("event.change_duration", json!({"legato": 0})));
-    }
-    if tb.small_button("Vel −10").clicked() {
-        op = Some(("event.change_velocity", json!({"add": -10})));
-    }
-    if tb.small_button("Vel +10").clicked() {
-        op = Some(("event.change_velocity", json!({"add": 10})));
-    }
-    if tb.small_button("Quantize").on_hover_text("Quantize to the grid").clicked() {
-        op = Some(("event.quantize", json!({"grid": grid_ticks, "strength": 100})));
-    }
-    if let Some((id, mut p)) = op {
-        p["clips"] = json!([cid.0]);
-        let _ = app.run(id, p);
-    }
+    let grid_ticks = grid_ticks_of(app);
+    midi_toolbar(app, ui, header, cid, grid_ticks);
     let s = app.engine.session_arc();
     let sr = s.sample_rate;
     let base_tick = s.tempo.samples_to_ticks(clip.start, sr);
@@ -170,15 +165,90 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     app.midi.scroll = app.midi.scroll.clamp(0.0, (128.0 * ROW_H - roll.height()).max(0.0));
     let scroll = app.midi.scroll;
     let px_per_tick = roll.width() / len_ticks as f32;
-    let x_of = |tick: i64| roll.min.x + tick as f32 * px_per_tick;
-    let y_of = |pitch: i32| roll.min.y + (127 - pitch) as f32 * ROW_H - scroll;
-    let pitch_at = |y: f32| 127 - ((y - roll.min.y + scroll) / ROW_H).floor() as i32;
+    let g = Roll { sequence, roll, keys, vel, px_per_tick, len_ticks, scroll, grid_ticks, rows };
     let painter = ui.painter().with_clip_rect(roll.union(keys));
+    draw_roll_background(&painter, &g);
+    // Notes.
+    let base = egui::Color32::from_rgb(track_color[0], track_color[1], track_color[2]);
+    draw_notes(app, &painter, &g, base);
+    note_pointer(app, ui, &g, cid, s.edit.tool == Tool::Pencil);
+    note_keys(app, ui, &g, cid);
+    velocity_lane(app, ui, &g, cid, base, full.min.x + 6.0);
+}
+
+/// The empty state: a prompt that adds a clip on the selected MIDI track when clicked.
+fn empty_state(app: &mut SoundApp, ui: &mut Ui, full: Rect, header: Rect) {
+    let t = Tokens::current();
+    let track = {
+        let s = app.engine.session();
+        s.tracks.iter().find(|t| t.kind.is_midi() && s.edit.selected_tracks.contains(&t.id)).map(|t| (t.id, t.name.clone()))
+    };
+    let msg = match &track {
+        Some((_, name)) => format!("Click to add a MIDI clip to {name} at the insertion point."),
+        None => "Select a MIDI clip (or a MIDI track) to edit its notes.".into(),
+    };
+    ui.painter().text(full.center(), Align2::CENTER_CENTER, msg, regular(13.0), t.text_dim);
+    let body = Rect::from_min_max(pos2(full.min.x, header.max.y), full.max);
+    if let Some((id, _)) = track
+        && ui.interact(body, ui.scope_id().with("new_clip"), Sense::click()).clicked()
+    {
+        let sel = app.engine.session().edit.selection;
+        if let Ok(v) = app.run("midi.new_clip", json!({"track": id.0, "start": sel.start, "end": sel.end})) {
+            let _ = app.run("edit.select", json!({"clips": [v["clip"]]}));
+        }
+    }
+}
+
+/// The grid step in ticks, from the Edit window's grid value.
+fn grid_ticks_of(app: &SoundApp) -> i64 {
+    match app.engine.session().edit.grid {
+        soundcraft_time::GridValue::Note { value, dotted, triplet } => {
+            let mut g = value.ticks();
+            if dotted {
+                g = g * 3 / 2;
+            }
+            if triplet {
+                g = g * 2 / 3;
+            }
+            g.max(1)
+        }
+        _ => TICKS_PER_QUARTER / 4,
+    }
+}
+
+/// The header toolbar: whole-clip MIDI operations.
+fn midi_toolbar(app: &mut SoundApp, ui: &mut Ui, header: Rect, cid: ClipId, grid_ticks: i64) {
+    // Header toolbar: whole-clip MIDI operations.
+    let bar = Rect::from_min_max(pos2(header.max.x - 330.0, header.min.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0));
+    let mut tb = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    tb.spacing_mut().item_spacing.x = 4.0;
+    let mut op: Option<(&str, serde_json::Value)> = None;
+    if tb.small_button("Legato").clicked() {
+        op = Some(("event.change_duration", json!({"legato": 0})));
+    }
+    if tb.small_button("Vel −10").clicked() {
+        op = Some(("event.change_velocity", json!({"add": -10})));
+    }
+    if tb.small_button("Vel +10").clicked() {
+        op = Some(("event.change_velocity", json!({"add": 10})));
+    }
+    if tb.small_button("Quantize").on_hover_text("Quantize to the grid").clicked() {
+        op = Some(("event.quantize", json!({"grid": grid_ticks, "strength": 100})));
+    }
+    if let Some((id, mut p)) = op {
+        p["clips"] = json!([cid.0]);
+        let _ = app.run(id, p);
+    }
+}
+
+/// Background rows, piano keys and the grid.
+fn draw_roll_background(painter: &egui::Painter, g: &Roll<'_>) {
+    let Roll { roll, keys, px_per_tick, len_ticks, grid_ticks, rows, .. } = *g;
     // Background rows and keys.
-    let top = pitch_at(roll.min.y);
+    let top = g.pitch_at(roll.min.y);
     for r in 0..=rows + 1 {
         let pitch = top - r;
-        let y = y_of(pitch);
+        let y = g.y_of(pitch);
         let row = Rect::from_min_size(pos2(roll.min.x, y), vec2(roll.width(), ROW_H));
         painter.rect_filled(row, 0.0, if is_black(pitch) { Color32::from_rgb(30, 30, 32) } else { Color32::from_rgb(40, 40, 42) });
         let key = Rect::from_min_size(pos2(keys.min.x, y), vec2(KEY_W - 2.0, ROW_H - 1.0));
@@ -195,20 +265,46 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         }
     }
     // Grid.
+    let step = grid_stride(grid_ticks, px_per_tick);
     let mut tick = 0;
     while tick <= len_ticks {
         let bar = tick % (TICKS_PER_QUARTER * 4) == 0;
-        let x = x_of(tick);
-        if grid_ticks as f32 * px_per_tick > 4.0 || bar {
-            painter.line_segment(
-                [pos2(x, roll.min.y), pos2(x, roll.max.y)],
-                Stroke::new(1.0, if bar { Color32::from_rgb(80, 80, 86) } else { Color32::from_rgb(50, 50, 54) }),
-            );
-        }
-        tick += grid_ticks;
+        let x = g.x_of(tick);
+        painter.line_segment(
+            [pos2(x, roll.min.y), pos2(x, roll.max.y)],
+            Stroke::new(1.0, if bar { Color32::from_rgb(80, 80, 86) } else { Color32::from_rgb(50, 50, 54) }),
+        );
+        tick = tick.saturating_add(step);
     }
+}
+
+/// Closest lines the grid draws, in points.
+const MIN_GRID_PX: f32 = 4.0;
+
+/// Ticks between grid lines: the grid when its lines are more than [`MIN_GRID_PX`] apart, else
+/// as few common multiples of the grid and a bar as keep that spacing (so every line is a snap
+/// position and falls on a bar). The lines drawn are then bounded by the roll's width, however long
+/// the clip, instead of by its length.
+fn grid_stride(grid_ticks: i64, px_per_tick: f32) -> i64 {
+    let bar_ticks = TICKS_PER_QUARTER * 4;
+    if grid_ticks as f32 * px_per_tick > MIN_GRID_PX {
+        return grid_ticks.max(1);
+    }
+    let grid = grid_ticks.max(1);
+    let (mut a, mut b) = (grid, bar_ticks);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let common = (grid / a).saturating_mul(bar_ticks);
+    // `as` saturates a huge or NaN quotient; a zero `px_per_tick` gives one common multiple.
+    let n = (MIN_GRID_PX / (common as f32 * px_per_tick)).ceil().max(1.0) as i64;
+    common.saturating_mul(n)
+}
+
+/// The notes, with a drag in progress applied.
+fn draw_notes(app: &SoundApp, painter: &egui::Painter, g: &Roll<'_>, base: Color32) {
+    let Roll { sequence, grid_ticks, .. } = *g;
     // Notes.
-    let base = egui::Color32::from_rgb(track_color[0], track_color[1], track_color[2]);
     let drag = app.midi.drag.clone();
     for (i, n) in sequence.notes.iter().enumerate() {
         let (mut st, mut ln, mut p) = (n.start, n.length, i32::from(n.pitch));
@@ -224,7 +320,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                 p = (p + d.dy_semi as i32).clamp(0, 127);
             }
         }
-        let r = Rect::from_min_max(pos2(x_of(st), y_of(p) + 1.0), pos2(x_of(st + ln).max(x_of(st) + 3.0), y_of(p) + ROW_H - 1.0));
+        let r = Rect::from_min_max(pos2(g.x_of(st), g.y_of(p) + 1.0), pos2(g.x_of(st + ln).max(g.x_of(st) + 3.0), g.y_of(p) + ROW_H - 1.0));
         let sel = app.midi.selected.contains(&i);
         let k = 0.45 + 0.55 * f32::from(n.velocity) / 127.0;
         let fill = if sel {
@@ -234,22 +330,17 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         };
         painter.rect(r, 2.0, fill, Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
     }
+}
+
+/// Pointer interaction on the roll: note and band selection, drags and clicks.
+fn note_pointer(app: &mut SoundApp, ui: &mut Ui, g: &Roll<'_>, cid: ClipId, pencil: bool) {
+    let Roll { sequence, roll, px_per_tick, grid_ticks, .. } = *g;
     // Interaction.
     let resp = ui.interact(roll, ui.scope_id().with(("roll", cid.0)), Sense::click_and_drag());
-    let hit = |pos: egui::Pos2| -> Option<(usize, bool)> {
-        sequence.notes.iter().enumerate().rev().find_map(|(i, n)| {
-            let r = Rect::from_min_max(
-                pos2(x_of(n.start), y_of(i32::from(n.pitch))),
-                pos2(x_of(n.start + n.length).max(x_of(n.start) + 3.0), y_of(i32::from(n.pitch)) + ROW_H),
-            );
-            r.contains(pos).then_some((i, pos.x > r.max.x - 5.0))
-        })
-    };
-    let snap = |tk: f32| -> i64 { ((tk / grid_ticks as f32).round() as i64) * grid_ticks };
     if resp.drag_started()
         && let Some(p) = resp.interact_pointer_pos()
     {
-        if let Some((i, edge)) = hit(p) {
+        if let Some((i, edge)) = g.hit(p) {
             if !app.midi.selected.contains(&i) {
                 app.midi.selected = vec![i];
             }
@@ -275,8 +366,8 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                 .enumerate()
                 .filter(|(_, n)| {
                     let r = Rect::from_min_max(
-                        pos2(x_of(n.start), y_of(i32::from(n.pitch))),
-                        pos2(x_of(n.start + n.length), y_of(i32::from(n.pitch)) + ROW_H),
+                        pos2(g.x_of(n.start), g.y_of(i32::from(n.pitch))),
+                        pos2(g.x_of(n.start + n.length), g.y_of(i32::from(n.pitch)) + ROW_H),
                     );
                     r.intersects(band)
                 })
@@ -288,7 +379,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     if resp.dragged()
         && let (Some(d), Some(p)) = (&mut app.midi.drag, resp.interact_pointer_pos())
     {
-        d.dx_ticks = snap((p.x - d.start.x) / px_per_tick);
+        d.dx_ticks = g.snap((p.x - d.start.x) / px_per_tick);
         d.dy_semi = -((p.y - d.start.y) / ROW_H).round() as i64;
     }
     if resp.drag_stopped()
@@ -306,7 +397,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     if resp.clicked()
         && let Some(p) = resp.interact_pointer_pos()
     {
-        match hit(p) {
+        match g.hit(p) {
             Some((i, _)) => {
                 if ui.input(|x| x.modifiers.shift) {
                     if !app.midi.selected.contains(&i) {
@@ -317,8 +408,8 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
                 }
                 // Audition on the instrument would go here (needs a live MIDI input path).
             }
-            None if s.edit.tool == Tool::Pencil => {
-                let pitch = pitch_at(p.y).clamp(0, 127);
+            None if pencil => {
+                let pitch = g.pitch_at(p.y).clamp(0, 127);
                 let start = (((p.x - roll.min.x) / px_per_tick) as i64 / grid_ticks) * grid_ticks;
                 let _ = app.run(
                     "midi.note_add",
@@ -329,6 +420,11 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             None => app.midi.selected.clear(),
         }
     }
+}
+
+/// Keyboard: select all, move and delete notes.
+fn note_keys(app: &mut SoundApp, ui: &mut Ui, g: &Roll<'_>, cid: ClipId) {
+    let Roll { sequence, roll, grid_ticks, .. } = *g;
     // Keyboard: Cmd+A select all; arrows transpose (Shift = octave) and move by the grid.
     if ui.rect_contains_pointer(roll) && !ui.ctx().egui_wants_keyboard_input() {
         let (all, up, down, left, right, shift) = ui.input(|i| {
@@ -373,12 +469,18 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         let _ = app.run("midi.note_delete", json!({"clip": cid.0, "indices": app.midi.selected}));
         app.midi.selected.clear();
     }
+}
+
+/// The velocity lane under the roll.
+fn velocity_lane(app: &mut SoundApp, ui: &mut Ui, g: &Roll<'_>, cid: ClipId, base: Color32, label_x: f32) {
+    let Roll { sequence, vel, .. } = *g;
+    let t = Tokens::current();
     // Velocity lane.
     ui.painter().rect_filled(vel, 0.0, Color32::from_rgb(28, 28, 30));
-    ui.painter().text(pos2(full.min.x + 6.0, vel.center().y), Align2::LEFT_CENTER, "Velocity", regular(10.0), t.text_dim);
+    ui.painter().text(pos2(label_x, vel.center().y), Align2::LEFT_CENTER, "Velocity", regular(10.0), t.text_dim);
     let vresp = ui.interact(vel, ui.scope_id().with(("vel", cid.0)), Sense::click_and_drag());
     for (i, n) in sequence.notes.iter().enumerate() {
-        let x = x_of(n.start);
+        let x = g.x_of(n.start);
         let h = (vel.height() - 4.0) * f32::from(n.velocity) / 127.0;
         let col = if app.midi.selected.contains(&i) { Color32::WHITE } else { base };
         ui.painter().line_segment([pos2(x + 1.0, vel.max.y - 2.0), pos2(x + 1.0, vel.max.y - 2.0 - h)], Stroke::new(3.0, col));
@@ -386,8 +488,8 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     }
     if (vresp.clicked() || vresp.dragged())
         && let Some(p) = vresp.interact_pointer_pos()
-        && let Some((i, n)) = sequence.notes.iter().enumerate().min_by_key(|(_, n)| ((x_of(n.start) - p.x).abs() * 10.0) as i64)
-        && (x_of(n.start) - p.x).abs() < 8.0
+        && let Some((i, n)) = sequence.notes.iter().enumerate().min_by_key(|(_, n)| ((g.x_of(n.start) - p.x).abs() * 10.0) as i64)
+        && (g.x_of(n.start) - p.x).abs() < 8.0
     {
         let v = (((vel.max.y - 2.0 - p.y) / (vel.height() - 4.0)) * 127.0).round().clamp(1.0, 127.0) as i64;
         let _ = app.engine.execute_merged("midi.note_edit", &json!({"clip": cid.0, "index": i, "velocity": v}), &format!("vel:{}", cid.0));
@@ -397,6 +499,24 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_lines_are_bounded_by_the_roll_width_not_the_clip_length() {
+        let sixteenth = TICKS_PER_QUARTER / 4;
+        // A 1000 pt roll showing a 4-bar clip: every sixteenth is 16 pt apart and drawn.
+        assert_eq!(grid_stride(sixteenth, 1000.0 / (16.0 * TICKS_PER_QUARTER as f32)), sixteenth);
+        // The same roll over a clip a billion ticks long: at most a line every 4 pt.
+        let (len, px_per_tick) = (1_000_000_000i64, 1000.0 / 1_000_000_000.0f32);
+        let step = grid_stride(sixteenth, px_per_tick);
+        assert_eq!(step % (TICKS_PER_QUARTER * 4), 0, "lines fall on bars");
+        assert!((len / step) <= 251, "{} lines", len / step);
+        // a dotted quarter grid (1440 ticks): every line is also a grid position
+        let dotted = TICKS_PER_QUARTER * 3 / 2;
+        let step = grid_stride(dotted, px_per_tick);
+        assert_eq!((step % dotted, step % (TICKS_PER_QUARTER * 4)), (0, 0), "lines are snap positions on bars: {step}");
+        assert!((len / step) <= 251, "{} lines", len / step);
+        assert!(grid_stride(0, 0.0) >= TICKS_PER_QUARTER * 4, "a zero grid or width still advances");
+    }
 
     #[test]
     fn switching_clip_drops_selection_and_gestures() {
