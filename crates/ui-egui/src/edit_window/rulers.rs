@@ -1,6 +1,9 @@
 use super::input::snap;
 use super::layout::{COLUMN_TITLES_H, COLUMNS, Column, HEADER_W, RULER_H, edit_columns, header_width, sample_at, x_of};
-use super::*;
+use super::{
+    Align2, Color32, GridValue, NoteValue, Range, Rect, Samples, Sense, Session, Shape, SoundApp, Stroke, TimeFormat, Tokens, Ui, bold,
+    format_position, json, pos2, regular, rgb, vec2,
+};
 
 // ---- rulers ----------------------------------------------------------------------------------
 
@@ -96,7 +99,13 @@ pub(super) fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect,
         let lab = Rect::from_min_max(pos2(area.min.x, y0), pos2(area.min.x + HEADER_W, y0 + h));
         y0 += h;
         let painter = ui.painter().with_clip_rect(row);
-        ui.painter().text(pos2(lab.max.x - 12.0, lab.center().y), Align2::RIGHT_CENTER, ruler_label(id), bold(11.0), t.ruler_text);
+        ui.painter().text(
+            pos2(lab.max.x - 12.0, lab.center().y),
+            Align2::RIGHT_CENTER,
+            crate::localization::text(ruler_label(id)),
+            bold(11.0),
+            t.ruler_text,
+        );
         let fmt = TimeFormat::from_id(id);
         match id.as_str() {
             "tempo" => {
@@ -107,7 +116,7 @@ pub(super) fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect,
                 {
                     let at = snap(&s, sample_at(&s, tl, p.x).max(0));
                     let bpm = s.tempo.tempo_at_tick(s.tempo.samples_to_ticks(at, sr));
-                    app.dialogs.open = Some(crate::dialogs::Dialog::TempoChange { at, bpm });
+                    app.dialogs.set(crate::dialogs::Dialog::TempoChange { at, bpm });
                 }
                 let mut last_label = f32::MIN;
                 for ev in s.tempo.tempos() {
@@ -148,7 +157,13 @@ pub(super) fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect,
             "key" => {
                 painter.rect_filled(row, 0.0, Color32::from_rgb(64, 52, 88));
                 if s.key_signatures.is_empty() {
-                    painter.text(pos2(tl.min.x + 6.0, row.center().y), Align2::LEFT_CENTER, "C major", bold(11.0), Color32::from_rgb(220, 214, 236));
+                    painter.text(
+                        pos2(tl.min.x + 6.0, row.center().y),
+                        Align2::LEFT_CENTER,
+                        crate::localization::text("C major"),
+                        bold(11.0),
+                        Color32::from_rgb(220, 214, 236),
+                    );
                 }
                 for (at, k) in &s.key_signatures {
                     let x = x_of(&s, tl, *at);
@@ -170,7 +185,7 @@ pub(super) fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect,
                 } else {
                     soundcraft_time::FrameRate::Fps25
                 };
-                timebase_ruler(ui, &painter, &s, tl, row, view, TimeFormat::Timecode, alt, i + 1 == rulers.len());
+                timebase_ruler(&painter, &s, &RulerRow { tl, row, view, bottom: i + 1 == rulers.len() }, TimeFormat::Timecode, alt);
             }
             "markers" | "markers2" | "markers3" | "markers4" | "markers5" | "chords" => {
                 let lane: u8 = match id.as_str() {
@@ -219,13 +234,14 @@ pub(super) fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect,
                     } else if resp.clicked()
                         && let Some(m) = hit
                     {
-                        let _ = app.run("markers.recall", json!({"number": m.number}));
+                        let command = if ui.input(|i| i.modifiers.alt) { "markers.delete" } else { "markers.recall" };
+                        let _ = app.run(command, json!({"number": m.number}));
                     }
                 }
             }
             _ => {
                 if let Some(f) = fmt {
-                    timebase_ruler(ui, &painter, &s, tl, row, view, f, s.frame_rate, i + 1 == rulers.len());
+                    timebase_ruler(&painter, &s, &RulerRow { tl, row, view, bottom: i + 1 == rulers.len() }, f, s.frame_rate);
                     // Clicking a timebase ruler locates.
                     let resp = ui.interact(row, ui.scope_id().with(("ruler", id.as_str())), Sense::click_and_drag());
                     if (resp.clicked() || resp.dragged())
@@ -247,17 +263,17 @@ pub(super) fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect,
     ui.painter().line_segment([pos2(area.min.x, area.max.y - 1.0), pos2(area.max.x, area.max.y - 1.0)], Stroke::new(1.0, t.border));
 }
 
-fn timebase_ruler(
-    _ui: &Ui,
-    painter: &egui::Painter,
-    s: &Session,
+/// Where a timebase ruler sits: the timeline, its row and the visible range, and whether it is the bottom ruler.
+#[derive(Clone, Copy)]
+struct RulerRow {
     tl: Rect,
     row: Rect,
     view: Range,
-    f: TimeFormat,
-    rate: soundcraft_time::FrameRate,
     bottom: bool,
-) {
+}
+
+fn timebase_ruler(painter: &egui::Painter, s: &Session, place: &RulerRow, f: TimeFormat, rate: soundcraft_time::FrameRate) {
+    let RulerRow { tl, row, view, bottom } = *place;
     let t = Tokens::current();
     let sr = s.sample_rate;
     let spp = s.edit.zoom.samples_per_px;
@@ -370,7 +386,7 @@ pub(super) fn column_titles(ui: &Ui, rulers: Rect, cols: &[Column]) {
     ui.painter().vline(end - 0.5, row.y_range(), line);
     for &(_, _, title, w) in cols {
         ui.painter().vline(x + 0.5, row.y_range(), line);
-        ui.painter().text(pos2(x + w / 2.0, row.center().y), Align2::CENTER_CENTER, title, bold(10.0), t.section_label);
+        ui.painter().text(pos2(x + w / 2.0, row.center().y), Align2::CENTER_CENTER, crate::localization::text(title), bold(10.0), t.section_label);
         x += w;
     }
 }
@@ -379,9 +395,9 @@ pub(super) fn column_titles(ui: &Ui, rulers: Rect, cols: &[Column]) {
 pub(super) fn views_button(app: &mut SoundApp, ui: &mut Ui, rulers: Rect) {
     let r = Rect::from_min_size(rulers.min + vec2(6.0, 5.0), vec2(50.0, 18.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
-    let resp = crate::widgets::selector_box(&mut child, r.width(), r.height(), "Views", Tokens::current().text);
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, child.is_enabled(), "Views"));
-    let resp = resp.on_hover_text("Columns beside the track headers: inserts, sends, I/O…");
+    let resp = crate::widgets::selector_box(&mut child, r.width(), r.height(), crate::localization::text("Views"), Tokens::current().text);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, child.is_enabled(), crate::localization::text("Views")));
+    let resp = resp.on_hover_text(crate::localization::text("Columns beside the track headers: inserts, sends, I/O…"));
     egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
         let shown = edit_columns(app.engine.session());
         for (id, label, _, _) in COLUMNS {
@@ -390,10 +406,10 @@ pub(super) fn views_button(app: &mut SoundApp, ui: &mut Ui, rulers: Rect) {
             }
         }
         ui.separator();
-        if ui.button("All").clicked() {
+        if ui.button(crate::localization::text("All")).clicked() {
             let _ = app.run("view.edit_all", json!({}));
         }
-        if ui.button("Minimal").clicked() {
+        if ui.button(crate::localization::text("Minimal")).clicked() {
             let _ = app.run("view.edit_minimal", json!({}));
         }
     });
