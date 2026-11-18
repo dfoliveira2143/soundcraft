@@ -123,10 +123,11 @@ where things are.
   Trim passes recorded live from the faders; thin, glide, coalesce and convert to clip gain.
 - **Plugins:** 7-band and 1-band EQ, compressor/limiter, expander/gate, de-esser, maximizer,
   channel strip, room and plate reverbs, mod delay, auto pan, chorus, flanger, phaser, ring
-  modulator, saturator, lo-fi, rectifier, subharmonic, pitch shifter, time shift, gain, trim,
-  invert, DC removal, signal generator, dither, a subtractive synth, a drum synth and a sampler
-  (plays any WAV, AIFF, FLAC, MP3 or OGG across the keyboard), all original. **CLAP plugins**
-  load too. Any processor runs offline as AudioSuite, and user presets save per plugin.
+  modulator, frequency shifter, saturator, lo-fi, rectifier, subharmonic, pitch shifter, time
+  shift, gain, trim, invert, DC removal, signal generator, dither, a subtractive synth, a drum
+  synth and a sampler (plays any WAV, AIFF, FLAC, MP3 or OGG across the keyboard), all original.
+  **CLAP plugins** load too. Any processor runs offline as AudioSuite, and user presets save
+  per plugin.
 - **MIDI:** instrument and MIDI tracks, a piano-roll MIDI editor with a velocity lane, an event
   list, a score view, step input, quantize, transpose, real-time properties, Standard MIDI Files,
   and Audio-to-MIDI from a sung or played melody.
@@ -134,8 +135,8 @@ where things are.
   playlist per take, input monitoring through the full channel strip, and autosave with recovery.
 - **Time and tempo:** Bars|Beats, Min:Secs, Timecode (every rate, drop-frame included),
   Feet+Frames and Samples; tempo and meter maps with a tempo editor; linear, parabolic and
-  S-curve tempo ramps; key signatures and detected chords; Beat Detective and Identify Beat;
-  pitch-preserving Elastic warping.
+  S-curve tempo ramps; key signatures and detected chords; Beat Analysis and Identify Beat;
+  pitch-preserving Elastic Audio warping.
 - **Audio files:** WAV/BWF/RF64, AIFF/AIFC and FLAC in and out; MP3, Ogg Vorbis, AAC, ALAC, CAF
   and the audio of MP4/MOV movies in. Any sample rate and bit depth.
 - **Bounce:** mix or stems to WAV, AIFF or FLAC at 16/24/32-bit float with optional dither and
@@ -146,8 +147,7 @@ where things are.
 ## Getting started
 
 Download a build from the [releases page](https://github.com/storytold/soundcraft/releases), or build
-from source with Rust 1.95 or later for the desktop/web UI (the core workspace's declared
-minimum remains Rust 1.90):
+from source with Rust 1.95 or later:
 
 ```sh
 git clone https://github.com/storytold/soundcraft
@@ -168,6 +168,16 @@ Useful shortcuts: <kbd>Space</kbd> play/stop, <kbd>⌘</kbd><kbd>=</kbd> Mix/Edi
 separate, <kbd>⌘</kbd><kbd>D</kbd> duplicate, <kbd>Enter</kbd> new marker, <kbd>⌘</kbd><kbd>⇧</kbd><kbd>N</kbd>
 new tracks. **Setup › Keyboard Shortcuts** lists them all.
 
+In **New Tracks**, each row has its own count, format, type, Samples/Ticks timebase and name.
+Use **+** to add a row below or **−** to remove it; **Create** makes all rows in order, with one
+Undo step (up to 128 tracks per creation). The last row stays available. The dropdown widths
+fit their longest option and remain fixed when the selection changes.
+
+On macOS, **⌘←/→** changes the active row's format, **⌘↑/↓** its type (also with **⌃**),
+and **⌥⌘↑/↓** its timebase. **⇧⌃⌘↓/↑** adds/removes the active row, also with **⌥**;
+**⇧⌘↓/↑** works too. Windows/Linux use **Ctrl** for **⌘**. The active row follows the
+field you click. A new row starts with its count focused and selected; Enter creates and Escape cancels.
+
 ### Logs
 
 The desktop app writes its `log` records to standard error and to `logs/soundcraft.log` in the
@@ -184,7 +194,7 @@ error only.
 | Variable | Effect |
 |---|---|
 | `RUST_LOG` | Log levels for standard error and the log file. Default: `info` for SoundCraft's own crates, `warn` for everything else. env_logger-style directives replace that, e.g. `RUST_LOG=debug`, `RUST_LOG=warn,soundcraft_mix=trace` or `RUST_LOG=info,wgpu_core=warn`; a directive ending in `*` covers every target starting with it (`soundcraft*=debug`). |
-| `SOUNDCRAFT_NO_PREFS` | No preferences read or written and no log file (agents' test runs). |
+| `SOUNDCRAFT_NO_PREFS` | `1`: no preferences read or written and no log file (agents' test runs). |
 
 The realtime audio thread never writes a record itself: the logger keeps the first one it logs
 (without waiting or allocating), counts the rest, and the UI thread writes them. The logger is
@@ -216,8 +226,10 @@ claude mcp add soundcraft -- soundcraft-cli mcp --demo
 soundcraft-cli mcp --automation-read-root DIR --automation-write-root DIR
 ```
 
-See [`docs/control-protocol.md`](docs/control-protocol.md) and [`docs/mcp.md`](docs/mcp.md).
-`soundcraft-cli commands` lists every command.
+See [`docs/cli.md`](docs/cli.md) for the command-line tool (subcommands, exit codes, environment
+variables, man pages and completions), [`docs/control-protocol.md`](docs/control-protocol.md) and
+[`docs/mcp.md`](docs/mcp.md). `soundcraft-cli commands` lists every command (`--json` for each
+one's parameters and details, as JSON).
 
 Open **SoundCraft › Session Audio Health** to check loaded audio availability, sample-rate
 mismatches and clip source bounds across all playlists, including alternate takes. The report
@@ -232,11 +244,10 @@ about egui, so the interface could be swapped for another one.
 
 | Crate | What it does |
 |---|---|
-| `soundcraft-time` | Timebases, tempo and meter maps, timecode, grid |
-| `soundcraft-audio-io` | Audio file formats and waveform overviews |
+| `soundcraft-time` | Compatibility re-export of `craft-time`'s SoundCraft sample-index API |
 | `soundcraft-midi` | Standard MIDI Files and MIDI operations |
 | `soundcraft-dsp` | Plugins, offline processing, meters, loudness, FFT |
-| `soundcraft-model` | The session document |
+| `soundcraft-model` | Compatibility re-export of `craft-scraft-format`'s schema, validation and JSON API |
 | `soundcraft-mix` | The mix engine (realtime and offline share it) |
 | `soundcraft-engine` | Commands, undo, editing, import/export, bounce |
 | `soundcraft-playback` | Audio devices (CoreAudio, WASAPI, ALSA, WebAudio) and recording |
@@ -253,8 +264,18 @@ SoundCraft is **pre-alpha**: it covers 94 % of the incumbent's menu items (measu
 its features by presence, and is roughly 40 % of the way to replacing it for real work: record,
 edit, mix and bounce work end to end, but choosing an audio interface and buffer size,
 recording MIDI from a controller and session interchange (AAF/OMF) are still missing, and those
-are the alpha checklist. Translations are missing too. The status, the stage and our effort
-estimates are in [`ROADMAP.md`](ROADMAP.md); the full assessment is in
+are the alpha checklist.
+
+**Translations:** the Brazilian Portuguese (`pt-BR`) catalog is **100 % complete** for every fixed
+UI string found in the current source — menus, dialogs and buttons, tooltips (including those
+localized inside buttons and toggles), accessibility names, the Edit-window status bar, the
+remove-session question, formatted messages, engine error templates and engine error text at display
+time. All these entries are covered by a test, placeholders match, keys are unique, and the
+`pt-BR` catalog is chosen automatically when `ui.language` is `pt-BR` (or "Portuguese (Brazil)")
+under `Setup › Appearance`. Engine errors keep their run-time values and a decimal comma in
+`pt-BR`. The remaining localization work is a native-speaker (human) review of wording plus CJK /
+Devanagari / Arabic font fallbacks and RTL layout — not new UI translation. The status, the stage
+and our effort estimates are in [`ROADMAP.md`](ROADMAP.md); the full assessment is in
 [`docs/target-app-parity.md`](docs/target-app-parity.md), the ranked list of what's missing in
 [`docs/gaps.md`](docs/gaps.md), and the menu-by-menu comparison in
 [`docs/parity-checklist.md`](docs/parity-checklist.md). Bug reports and wish lists are
@@ -339,7 +360,15 @@ stand on its own.
 | <img src="https://raw.githubusercontent.com/storytold/pdfcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.pdfcraft.png" alt="" width="32" height="32"> | **PdfCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/pdfcraft) | [Website](https://getartcraft.com/apps/pdfcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/effectcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.effectcraft.png" alt="" width="32" height="32"> | **EffectCraft** | Motion graphics and visual effects | [GitHub](https://github.com/storytold/effectcraft) | [Website](https://getartcraft.com/apps/effectcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/designcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.designcraft.png" alt="" width="32" height="32"> | **DesignCraft** | Page layout and publishing | [GitHub](https://github.com/storytold/designcraft) | [Website](https://getartcraft.com/apps/designcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/soundcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.soundcraft.png" alt="" width="32" height="32"> | **SoundCraft** | **Recording, editing and mixing audio · you are here** | [GitHub](https://github.com/storytold/soundcraft) | [Website](https://getartcraft.com/apps/soundcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/figcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.figcraft.png" alt="" width="32" height="32"> | **FigCraft** | Interface design and prototyping | [GitHub](https://github.com/storytold/figcraft) | [Website](https://getartcraft.com/apps/figcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/wordcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.wordcraft.png" alt="" width="32" height="32"> | **WordCraft** | Word processing and documents | [GitHub](https://github.com/storytold/wordcraft) | [Website](https://getartcraft.com/apps/wordcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/soundcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.soundcraft.png" alt="" width="32" height="32"> | **SoundCraft** | Audio recording and editing | [GitHub](https://github.com/storytold/soundcraft) | [Website](https://getartcraft.com/apps/soundcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/deckcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.deckcraft.png" alt="" width="32" height="32"> | **DeckCraft** | Presentations and slide decks | [GitHub](https://github.com/storytold/deckcraft) | [Website](https://getartcraft.com/apps/deckcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/cadcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.cadcraft.png" alt="" width="32" height="32"> | **CADCraft** | Computer-aided design | [GitHub](https://github.com/storytold/cadcraft) | [Website](https://getartcraft.com/apps/cadcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/gridcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.gridcraft.png" alt="" width="32" height="32"> | **GridCraft** | Spreadsheets and data | [GitHub](https://github.com/storytold/gridcraft) | [Website](https://getartcraft.com/apps/gridcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/texturecraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.texturecraft.png" alt="" width="32" height="32"> | **TextureCraft** | 3D texture painting | [GitHub](https://github.com/storytold/texturecraft) | [Website](https://getartcraft.com/apps/texturecraft) |
+| <img src="https://raw.githubusercontent.com/storytold/craft-anything/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.craft-anything.png" alt="" width="32" height="32"> | **Craft Anything** | See how any software works, then build your own | [GitHub](https://github.com/storytold/craft-anything) | [Website](https://getartcraft.com/apps/craft-anything) |
+| <img src="https://raw.githubusercontent.com/tangency-labs/solidcraft/main/assets/icons/app/linux/exports/hicolor/64x64/apps/io.tangencylabs.solidcraft.png" alt="" width="32" height="32"> | **SolidCraft** | Parametric 3D CAD by Tangency Labs (community app) | [GitHub](https://github.com/tangency-labs/solidcraft) | |
 
 And [**ArtCraft**](https://getartcraft.com/) itself, our AI image and video studio for artists who want real control.
 
