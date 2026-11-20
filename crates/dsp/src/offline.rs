@@ -127,8 +127,11 @@ pub fn remove_dc(ch: &mut [Vec<f32>]) {
         if c.is_empty() {
             continue;
         }
-        let mean = c.iter().filter(|v| v.is_finite()).map(|&v| f64::from(v)).sum::<f64>() / c.len() as f64;
-        let m = mean as f32;
+        let (sum, n) = c.iter().filter(|v| v.is_finite()).fold((0.0f64, 0usize), |(s, n), &v| (s + f64::from(v), n + 1));
+        if n == 0 {
+            continue;
+        }
+        let m = (sum / n as f64) as f32;
         c.iter_mut().for_each(|s| *s -= m);
     }
 }
@@ -316,6 +319,15 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a.max(1)
 }
 
+/// The number of samples [`resample`] gives for `len` samples converted from `from` to `to` Hz,
+/// so a caller can lay out converted audio before converting it.
+pub fn resampled_len(len: usize, from: u32, to: u32) -> usize {
+    if from == 0 || to == 0 || from == to {
+        return len;
+    }
+    ((len as f64 * (f64::from(to) / f64::from(from))).round() as usize).min(MAX_OFFLINE_SAMPLES)
+}
+
 /// High-quality windowed-sinc sample-rate conversion from `from` Hz to `to` Hz.
 pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     if from == 0 || to == 0 || from == to {
@@ -327,7 +339,7 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     let bank = Polyphase::new(from, to, &table);
     ch.iter()
         .map(|c| {
-            let out_len = ((c.len() as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
+            let out_len = resampled_len(c.len(), from, to);
             match &bank {
                 Some(b) => b.run(c, out_len),
                 None => resample_channel(c, ratio, out_len, &table),
@@ -888,5 +900,15 @@ mod tests {
         assert_eq!(ch[0][99], 0.0);
         assert_eq!(ch[0][50], 1.0);
         fade(&mut ch, 1000, 1000, FadeShape::SCurve);
+    }
+
+    #[test]
+    fn remove_dc_ignores_non_finite_samples_in_the_mean() {
+        let mut ch = vec![vec![f32::NAN, 1.0, 1.0, 1.0]];
+        remove_dc(&mut ch);
+        assert!(ch[0][1..].iter().all(|x| x.abs() < 1e-6), "left over dc {:?}", ch[0]);
+        let mut all_bad = vec![vec![f32::NAN, f32::INFINITY]];
+        remove_dc(&mut all_bad);
+        assert!(all_bad[0][0].is_nan() && all_bad[0][1].is_infinite());
     }
 }
