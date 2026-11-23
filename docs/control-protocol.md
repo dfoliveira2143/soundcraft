@@ -7,7 +7,7 @@ input), and every command is reachable from:
 | Surface | How |
 |---|---|
 | Desktop app control channel | `soundcraft --control <port>` (`0` = pick a free port; printed as `SOUNDCRAFT_CONTROL_PORT=…`) |
-| CLI against a running app | `soundcraft-cli app --port <port> <method or command id> [JSON]` |
+| CLI against a running app | `soundcraft-cli app --port <port> <method or command id> [JSON]` (see [cli.md](cli.md)) |
 | Headless CLI | `soundcraft-cli run --demo --cmd 'mix.volume={"track":"Kick","db":-6}' --bounce out.wav` |
 | MCP (headless) | `soundcraft-cli mcp [--demo]` |
 | MCP (bridged to the app) | `soundcraft-cli mcp --connect <port>` |
@@ -33,7 +33,7 @@ Newline-delimited JSON over TCP on `127.0.0.1`. One request per line, one reply 
 {"id": 1, "ok": true, "result": {"tracks": [12, 13]}}
 ```
 
-Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no track named `Nope`"}`.
+Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no track named `Nope`"}`. A line that is not a JSON object with a string `method` gets one error reply, and the connection is closed.
 
 ## Methods
 
@@ -43,7 +43,7 @@ Errors: `{"id": 1, "ok": false, "error": "bad parameters for `mix.volume`: no tr
 | `engine.commands` | `{filter?}` | Every command: id, label, menu path, shortcut, params doc, enabled + reason. Includes UI-layer commands (`window.*`). |
 | `engine.parity` | `{}` | Parity report against the incumbent's menu catalog. |
 | `session.inspect` | `{detail?: "summary"|"full"}` | The document: tracks, clips (with times), inserts (+params when full), sends, routing, automation, markers, groups, busses, sources (`loaded` true when decoded audio is in the pool), selection, zoom (`samples_per_px`, `scroll`), transport, undo label. |
-| `ui.inspect` | `{}` | UI state (`window`, panels, dialogs), window size, playing/position, audio device, and `edit_layout` (timeline rect and every track row's rect, for clicking). |
+| `ui.inspect` | `{}` | UI state (`window`, panels, dialogs), window size, playing/position, audio device, MIDI inputs (`midi_inputs`: name, enabled, open; `midi_events`: messages received so far; `midi_events_dropped`: messages a full input queue dropped), and `edit_layout` (timeline rect and every track row's rect, for clicking). |
 | `ui.set` | any `UiState` fields | e.g. `{"window": "Mix", "narrow_mix": true}`. |
 | `ui.menu.list` | `{}` | Every catalog menu path and the command that implements it (or null). |
 | `ui.menu.invoke` | `{path}` or `{id}` | Like clicking the menu item: may open its dialog (e.g. `"Track > New..."`). |
