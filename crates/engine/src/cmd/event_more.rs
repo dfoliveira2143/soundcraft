@@ -128,7 +128,7 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!(
             "event.beat_detective",
-            "Beat Detective",
+            "Beat Analysis",
             ["Event"],
             None,
             "{tracks?, start?, end?, sensitivity?: 0.5, separate?: false, set_tempo?: false}",
@@ -274,7 +274,12 @@ fn tempo_curve(e: &mut Engine, p: &Value, curve: Curve, id: &str) -> Result<Valu
 
 fn tempo_stretch(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = "event.tempo_stretch";
-    let (r, t0, t1) = selection_ticks(e, p, id)?;
+    // Here `length` is the new length of the selection, not part of the range.
+    let mut range_params = p.clone();
+    if let Some(m) = range_params.as_object_mut() {
+        m.remove("length");
+    }
+    let (r, t0, t1) = selection_ticks(e, &range_params, id)?;
     let factor = match position_param(e, id, p, "length")? {
         Some(l) if l > 0 => l as f64 / r.len() as f64,
         _ => f64_or(p, "factor", f64::NAN),
@@ -344,7 +349,10 @@ fn select_split(e: &mut Engine, p: &Value) -> Result<Value> {
         };
         let mut nc = c.clone();
         nc.id = s.new_clip_id();
-        nc.content = ClipContent::Midi { sequence: soundcraft_midi::Sequence { notes: hit, ctrls: Vec::new() } };
+        // Note-split has always copied only the matching notes, not controllers. SysEx is the same
+        // default now that Sequence has that field: packets stay on the source clip. Full SysEx
+        // split/trim/heal is storytold/soundcraft#1618.
+        nc.content = ClipContent::Midi { sequence: soundcraft_midi::Sequence { notes: hit, ctrls: Vec::new(), sysex: Vec::new() } };
         crate::edit::place_clip(s, nt, nc);
     }
     Ok(json!({"matched": matched, "split": split, "tracks": new_tracks.values().collect::<Vec<_>>()}))
@@ -901,6 +909,15 @@ mod tests {
         }
     }
 
+    /// For `event.tempo_stretch`, `length` is the new length of the selection, so the selection stays the range.
+    #[test]
+    fn tempo_stretch_length_keeps_selection_range() {
+        let mut e = Engine::default();
+        e.session_mut().edit.selection = Range::new(0, 96_000);
+        e.execute("event.tempo_stretch", &json!({"length": 192_000})).unwrap();
+        assert_eq!(e.session().tempo.tempo_at_tick(0), 60.0);
+    }
+
     #[test]
     fn tempo_curves() {
         let mut e = Engine::default();
@@ -943,6 +960,44 @@ mod tests {
         let nt = e.session().tracks.iter().find(|x| x.id != t).unwrap();
         match &nt.clips()[0].content {
             ClipContent::Midi { sequence } => assert_eq!(sequence.notes[0].pitch, 72),
+            _ => panic!(),
+        }
+    }
+
+    /// Note-split copies only the notes in the pitch range. SysEx already on the clip stays there;
+    /// the new clip's sysex list is empty (storytold/soundcraft#1618 owns split/trim of packets).
+    #[test]
+    fn note_split_leaves_sysex_on_the_source_clip() {
+        let (mut e, t) = midi_engine();
+        let r = e
+            .execute(
+                "event.retrospective_record",
+                &json!({"track": t.0, "notes": [{"pitch": 36, "start_ticks": 0}, {"pitch": 72, "start_ticks": 0}]}),
+            )
+            .unwrap();
+        let cid = r["clip"].as_u64().unwrap();
+        let packet = soundcraft_midi::SysExEvent { tick: 0, status: 0xF0, data: vec![0x43, 0x10, 0x4C, 0x00, 0x00, 0x7E, 0x00, 0xF7] };
+        if let Some(c) = e.session_mut().find_clip_mut(ClipId(cid))
+            && let ClipContent::Midi { sequence } = &mut c.content
+        {
+            sequence.sysex.push(packet.clone());
+        }
+        e.execute("edit.select", &json!({"clips": [cid]})).unwrap();
+        e.execute("event.select_split_notes", &json!({"pitch_from": 60, "pitch_to": 127, "action": "split"})).unwrap();
+        let source = e.session().find_clip(ClipId(cid)).map(|(_, c)| c.clone()).unwrap();
+        match &source.content {
+            ClipContent::Midi { sequence } => {
+                assert_eq!(sequence.notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), vec![36]);
+                assert_eq!(sequence.sysex, vec![packet]);
+            }
+            _ => panic!(),
+        }
+        let nt = e.session().tracks.iter().find(|x| x.id != t).unwrap();
+        match &nt.clips()[0].content {
+            ClipContent::Midi { sequence } => {
+                assert_eq!(sequence.notes[0].pitch, 72);
+                assert!(sequence.sysex.is_empty());
+            }
             _ => panic!(),
         }
     }
