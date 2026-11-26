@@ -63,6 +63,36 @@ fn new_session_cancels_play_queued_before_the_next_frame() {
 }
 
 #[test]
+fn play_from_starts_at_from_regardless_of_the_selection() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.run("edit.select", json!({"tracks": ["Kick"], "start": 7_632_000, "end": 7_680_000})).unwrap();
+    app.run("transport.play", json!({"from": 4_560_000})).unwrap();
+    app.handle_transport(0.25);
+    assert!(app.is_playing());
+    assert_eq!(app.engine.transport.position, 4_560_000 + 12_000);
+
+    app.run("transport.play", json!({"from": 96_000})).unwrap();
+    app.handle_transport(0.25);
+    assert!(app.is_playing());
+    assert_eq!(app.engine.transport.position, 96_000 + 12_000);
+}
+
+#[test]
+fn play_from_while_looping_drops_the_selection_loop() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.run("options.loop_playback", json!({"value": true})).unwrap();
+    app.run("edit.select", json!({"tracks": ["Kick"], "start": 96_000, "end": 144_000})).unwrap();
+    app.run("transport.play", json!({})).unwrap();
+    app.handle_transport(0.25);
+    assert!(app.is_playing());
+    app.run("transport.play", json!({"from": 480_000})).unwrap();
+    app.handle_transport(0.25);
+    app.handle_transport(0.25);
+    assert!(app.is_playing());
+    assert_eq!(app.engine.transport.position, 480_000 + 24_000);
+}
+
+#[test]
 fn record_with_nothing_armed_says_what_to_do() {
     let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
     app.run("transport.record", json!({})).unwrap();
@@ -244,6 +274,67 @@ fn a_pass_and_the_fader_ride_driving_it_are_one_undo_step() {
     assert_eq!(app.engine.undo_history().len(), steps + 1);
 }
 
+/// #1146: a send's level writes its own automation lane, by the track's mode like its fader: Touch
+/// while the send is dragged, Latch from the first drag until stop, Write throughout. The track's
+/// volume lane is left alone.
+#[test]
+fn a_dragged_send_level_writes_send_automation() {
+    use soundcraft_model::AutoParam;
+    let points = |app: &SoundApp, param: &AutoParam| app.engine.session().track_by_name("Lead").unwrap().lane(param).map_or(0, |l| l.points.len());
+    let level = |app: &SoundApp| app.engine.session().track_by_name("Lead").unwrap().lane(&AutoParam::SendLevel(0)).map(|l| l.points.clone());
+    let pass = |app: &mut SoundApp| {
+        app.handle_transport(0.1);
+        app.write_automation();
+    };
+    for mode in ["touch", "latch", "write"] {
+        let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        let lead = app.engine.session().track_by_name("Lead").unwrap().id;
+        assert!(app.engine.session().track(lead).unwrap().mixer.sends[0].is_some(), "the demo's Lead sends to the reverb");
+        let volume = points(&app, &AutoParam::Volume);
+        app.run("mix.automation_mode", json!({"tracks": ["Lead"], "mode": mode})).unwrap();
+        app.run("transport.play", json!({})).unwrap();
+        for _ in 0..3 {
+            pass(&mut app);
+        }
+        let before_drag = points(&app, &AutoParam::SendLevel(0));
+        if mode == "write" {
+            assert!(before_drag > 0, "Write writes the send without a drag");
+        } else {
+            assert_eq!(before_drag, 0, "{mode}: nothing written before the send is touched");
+        }
+        // What the send's slot and its floating window do while the level is dragged.
+        app.pointer_down = true;
+        app.gesture = Some(super::Gesture::SendFader { track: lead, slot: 0 });
+        for frame in 0..4 {
+            pass(&mut app);
+            let db = -12.0 + frame as f32;
+            app.engine.execute_merged("mix.send_level", &json!({"track": lead.0, "slot": 0, "db": db}), &format!("send:{}:0", lead.0)).unwrap();
+        }
+        let dragged = points(&app, &AutoParam::SendLevel(0));
+        assert!(dragged >= before_drag + 3, "{mode}: the drag is written ({before_drag} -> {dragged})");
+        assert!(level(&app).unwrap().iter().any(|p| (p.value - (-10.0)).abs() < 1e-6), "{mode}: the points follow the send level");
+        // Released.
+        app.pointer_down = false;
+        app.gesture = None;
+        for _ in 0..3 {
+            pass(&mut app);
+        }
+        let released = points(&app, &AutoParam::SendLevel(0));
+        if mode == "touch" {
+            assert_eq!(released, dragged, "Touch stops writing when the send is let go");
+        } else {
+            assert!(released > dragged, "{mode}: keeps writing after the release");
+        }
+        app.run("transport.stop", json!({})).unwrap();
+        app.handle_transport(0.0);
+        app.write_automation();
+        if mode != "write" {
+            assert_eq!(points(&app, &AutoParam::Volume), volume, "{mode}: the track's volume lane is left alone");
+        }
+        assert!(app.touched_sends.is_empty(), "{mode}: stop ends the pass");
+    }
+}
+
 #[test]
 fn plugin_states_read_during_a_drag_keep_it_one_undo_step() {
     let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
@@ -366,6 +457,8 @@ fn a_preset_changed_in_an_effect_editor_is_stored_once() {
 fn preferences_saved_before_the_window_was_remembered_keep_full_scale() {
     let ui: super::UiState = serde_json::from_value(json!({"show_transport": true})).unwrap();
     assert_eq!((ui.window_size, ui.window_maximized, ui.ui_scale), ([1600.0, 1000.0], false, 1.0));
+    assert_eq!(ui.reduce_visual_effects, crate::preferences::ReduceVisualEffects::Never);
+    assert_eq!(ui.undo_levels, 64);
 }
 
 #[test]
@@ -434,6 +527,7 @@ fn ordinary_play_after_stop_is_full_speed() {
 #[test]
 fn one_synthetic_batch_survives_hidden_ticks_and_applies_once() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let raw = |w: f32| {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 900.0));
@@ -495,6 +589,7 @@ impl egui::DroppedFile for TestDrop {
 #[test]
 fn a_drop_before_fonts_are_ready_is_imported_once_after_layout() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::Engine::default(), None, super::Services::default());
     let mut first =
         egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
@@ -524,6 +619,7 @@ fn a_drop_before_fonts_are_ready_is_imported_once_after_layout() {
 #[test]
 fn a_retained_host_input_holds_one_copy_of_a_pending_batch() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let hidden = egui::ViewportInfo { minimized: Some(true), ..Default::default() };
@@ -604,6 +700,7 @@ fn a_pending_synthetic_batch_asks_a_hidden_window_for_a_paint() {
 #[test]
 fn frame_time_counts_a_multi_pass_frame_once() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -638,6 +735,7 @@ fn frame_time_counts_a_multi_pass_frame_once() {
 #[test]
 fn a_synthetic_pass_does_not_publish_os_clipboard_commands() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -689,6 +787,7 @@ fn a_synthetic_pass_does_not_publish_os_clipboard_commands() {
 #[test]
 fn a_held_key_does_not_turn_a_scripted_press_into_a_repeat() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -747,11 +846,85 @@ fn a_held_key_does_not_turn_a_scripted_press_into_a_repeat() {
     assert!(ctx.input(|i| i.key_down(egui::Key::Z)), "the host still holds Z after the repeat");
 }
 
+/// Runs one input pass of `app` carrying host key `events` (no scripted input).
+fn key_pass(ctx: &egui::Context, app: &mut SoundApp, events: Vec<egui::Event>) {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+    let mut input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
+    app.raw_input_hook(ctx, &mut input);
+    let mut out = ctx.run_ui(input, |ui| {
+        app.logic(ui.ctx());
+        app.ui(ui);
+    });
+    out.textures_delta.clear();
+}
+
+/// The demo app after a few idle passes, ready for keyboard input.
+fn app_for_keys() -> (egui::Context, SoundApp) {
+    let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    for _ in 0..4 {
+        key_pass(&ctx, &mut app, Vec::new());
+    }
+    (ctx, app)
+}
+
+/// A host press of `key` and then two host auto-repeats of it, each in its own pass, as holding the key gives.
+fn hold_key(ctx: &egui::Context, app: &mut SoundApp, key: egui::Key, modifiers: egui::Modifiers) {
+    for repeat in [false, true, true] {
+        key_pass(ctx, app, vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat, modifiers }]);
+    }
+    key_pass(ctx, app, vec![egui::Event::Key { key, physical_key: Some(key), pressed: false, repeat: false, modifiers }]);
+}
+
+/// #1377: holding a zoom key keeps zooming, one step per auto-repeat.
+#[test]
+fn holding_t_or_r_keeps_zooming_the_timeline() {
+    let (ctx, mut app) = app_for_keys();
+    let start = app.engine.session().edit.zoom.samples_per_px;
+    hold_key(&ctx, &mut app, egui::Key::T, egui::Modifiers::NONE);
+    assert_eq!(app.engine.session().edit.zoom.samples_per_px, start / 8.0, "T and two repeats zoom in three steps");
+    hold_key(&ctx, &mut app, egui::Key::R, egui::Modifiers::NONE);
+    assert_eq!(app.engine.session().edit.zoom.samples_per_px, start, "R and two repeats zoom back out three steps");
+}
+
+/// #1377: the registry's Cmd+[ / Cmd+] and the Cmd+Alt+[ / ] waveform zoom repeat too.
+#[test]
+fn holding_a_zoom_chord_keeps_zooming() {
+    let (ctx, mut app) = app_for_keys();
+    let cmd = egui::Modifiers { command: true, ..egui::Modifiers::NONE };
+    let start = app.engine.session().edit.zoom.samples_per_px;
+    hold_key(&ctx, &mut app, egui::Key::OpenBracket, cmd);
+    assert_eq!(app.engine.session().edit.zoom.samples_per_px, start * 8.0, "Cmd+[ and two repeats zoom out three steps");
+    hold_key(&ctx, &mut app, egui::Key::CloseBracket, cmd);
+    assert_eq!(app.engine.session().edit.zoom.samples_per_px, start, "Cmd+] and two repeats zoom in three steps");
+    let waveform = app.engine.session().edit.zoom.waveform_zoom;
+    hold_key(&ctx, &mut app, egui::Key::CloseBracket, egui::Modifiers { alt: true, ..cmd });
+    assert_eq!(app.engine.session().edit.zoom.waveform_zoom, waveform * 8.0, "Cmd+Alt+] and two repeats raise the waveform three steps");
+}
+
+/// Only the zoom commands repeat: a held registry chord (Cmd+Z) still undoes once and a held
+/// `fixed` key (Enter) still adds one marker.
+#[test]
+fn holding_cmd_z_or_enter_still_runs_once() {
+    let (ctx, mut app) = app_for_keys();
+    for _ in 0..3 {
+        app.run("track.new", json!({"count": 1, "format": "stereo"})).unwrap();
+    }
+    let depth = app.engine.undo_history().len();
+    hold_key(&ctx, &mut app, egui::Key::Z, egui::Modifiers { command: true, ..egui::Modifiers::NONE });
+    assert_eq!(app.engine.undo_history().len(), depth - 1, "auto-repeats of Cmd+Z are ignored");
+    let markers = app.engine.session().markers.len();
+    hold_key(&ctx, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+    assert_eq!(app.engine.session().markers.len(), markers + 1, "auto-repeats of Enter are ignored");
+}
+
 /// A fresh physical Cmd+Z and an identical scripted Cmd+Z in one frame are distinct actions.
 /// Matching them by value would swallow the scripted press; provenance keeps both.
 #[test]
 fn a_fresh_host_press_and_a_scripted_press_both_run() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -790,6 +963,7 @@ fn a_fresh_host_press_and_a_scripted_press_both_run() {
 #[test]
 fn a_hidden_logic_tick_after_the_hook_keeps_the_held_key_and_pending_batch() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let visible = egui::ViewportInfo { inner_rect: Some(rect), ..Default::default() };
@@ -858,6 +1032,7 @@ fn a_hidden_logic_tick_after_the_hook_keeps_the_held_key_and_pending_batch() {
 #[test]
 fn a_multi_pass_frame_keeps_the_held_key_and_applies_the_scripted_press_once() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -915,6 +1090,7 @@ fn a_multi_pass_frame_keeps_the_held_key_and_applies_the_scripted_press_once() {
 #[test]
 fn a_focus_loss_clears_a_held_key_with_a_pending_scripted_press() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -973,6 +1149,7 @@ fn a_focus_loss_clears_a_held_key_with_a_pending_scripted_press() {
 #[test]
 fn a_host_key_with_the_same_signature_does_not_acknowledge_the_batch() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -1058,6 +1235,7 @@ fn synthetic_key_acknowledgement_ignores_only_the_rewritten_repeat_flag() {
 #[test]
 fn a_discarded_pass_acknowledges_the_synthetic_batch_it_received() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -1122,6 +1300,7 @@ fn real_widgets_apply_a_scripted_edit_navigation_and_cut_once_despite_consuming_
             let mut engine = soundcraft_engine::Engine::default();
             engine.execute("track.new", &json!({})).unwrap();
             let mut rig = Self { ctx: egui::Context::default(), app: SoundApp::new(engine, None, Services::default()), shapes: Vec::new() };
+            crate::framework::install_headless(&rig.ctx);
             rig.frames(4);
             rig
         }
@@ -1252,6 +1431,7 @@ fn real_widgets_apply_a_scripted_edit_navigation_and_cut_once_despite_consuming_
 #[test]
 fn a_hidden_tick_does_not_write_automation_from_the_last_pass_pointer() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let kick = app.engine.session().track_by_name("Kick").unwrap().id;
     app.run("mix.automation_mode", json!({"tracks": ["Kick"], "mode": "touch"})).unwrap();
@@ -1294,6 +1474,7 @@ fn a_hidden_tick_does_not_write_automation_from_the_last_pass_pointer() {
 #[test]
 fn a_font_gated_pass_does_not_ack_the_pending_synthetic_batch() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -1305,7 +1486,9 @@ fn a_font_gated_pass_does_not_ack_the_pending_synthetic_batch() {
         app.ui(ui);
     });
     out.textures_delta.clear();
-    assert!(!app.fonts_ready, "the first pass installs fonts but does not lay out");
+    // The fonts load in the gated first pass, which asks for a discard pass (`craft_ui::fonts::load`); that pass
+    // lays out with them but gets no input events, so neither pass acknowledges the batch.
+    assert!(app.fonts_installed, "the first pass installs fonts");
     assert!(app.synthetic_batch.is_some(), "the font gate returns before the acknowledgement");
     assert_eq!(app.synthetic_applied_batches, 0);
     // The next hook offers the same batch to the first laid-out pass, which applies it once.
@@ -1335,6 +1518,7 @@ fn a_font_gated_pass_does_not_ack_the_pending_synthetic_batch() {
 #[test]
 fn a_settled_pass_that_did_not_receive_the_batch_does_not_ack_it() {
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = super::SoundApp::new(soundcraft_engine::demo::demo_engine(), None, super::Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
@@ -1387,6 +1571,56 @@ fn transport_simulation_advances_by_monotonic_elapsed_time_only() {
     app.engine.transport.playing = false;
     app.sim = None;
 }
+/// One host iteration: the raw-input hook, then logic and UI in a single pass.
+fn run_host_frame(app: &mut SoundApp, ctx: &egui::Context, mut input: egui::RawInput) {
+    app.raw_input_hook(ctx, &mut input);
+    let mut output = ctx.run_ui(input, |ui| {
+        app.logic(ui.ctx());
+        app.ui(ui);
+    });
+    output.textures_delta.clear();
+}
+
+/// Run one frame that discards its first layout pass; returns how many passes ran.
+fn run_host_frame_discarding_first_pass(app: &mut SoundApp, ctx: &egui::Context, input: egui::RawInput) -> usize {
+    let mut passes = 0;
+    let mut output = ctx.run_ui(input, |ui| {
+        app.logic(ui.ctx());
+        passes += 1;
+        if passes == 1 {
+            ui.ctx().request_discard("plugin gesture must survive a second layout pass");
+        }
+        app.ui(ui);
+    });
+    output.textures_delta.clear();
+    passes
+}
+
+/// The editor-poll fixture: each poll counts itself, takes the queued edits and, for the gestures that
+/// ended, captures the instrument state `latest` holds.
+fn poll_fixture(
+    reports: &std::rc::Rc<std::cell::RefCell<Vec<soundcraft_playback::EditorEdit>>>,
+    latest: &std::rc::Rc<std::cell::Cell<u8>>,
+    polls: &std::rc::Rc<std::cell::Cell<i32>>,
+    captures: &std::rc::Rc<std::cell::RefCell<Vec<(soundcraft_model::TrackId, usize)>>>,
+) -> super::EditorPollFixture {
+    let (poll_reports, poll_latest, poll_count, poll_captures) = (reports.clone(), latest.clone(), polls.clone(), captures.clone());
+    Box::new(move |pending| {
+        poll_count.set(poll_count.get() + 1);
+        let edits = std::mem::take(&mut *poll_reports.borrow_mut());
+        super::editor_changes(
+            pending,
+            edits,
+            Vec::new(),
+            |_| false,
+            |due| {
+                poll_captures.borrow_mut().extend_from_slice(due);
+                due.iter().map(|&(track, slot)| (track, slot, vec![poll_latest.get(), 1])).collect()
+            },
+        )
+    })
+}
+
 /// Plugin queues are drained once per host iteration, rather than once per discarded pass.
 /// The fixture replaces only native polling; the real raw hook, logic/UI, scheduler and
 /// engine state/undo commands run normally.
@@ -1396,17 +1630,12 @@ fn editor_gesture_polling_survives_discarded_and_hidden_host_iterations() {
     use std::rc::Rc;
 
     let ctx = egui::Context::default();
+    crate::framework::install_headless(&ctx);
     let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
     let raw = || egui::RawInput { screen_rect: Some(rect), ..Default::default() };
     for _ in 0..4 {
-        let mut input = raw();
-        app.raw_input_hook(&ctx, &mut input);
-        let mut output = ctx.run_ui(input, |ui| {
-            app.logic(ui.ctx());
-            app.ui(ui);
-        });
-        output.textures_delta.clear();
+        run_host_frame(&mut app, &ctx, raw());
     }
     let keys = app.engine.session().track_by_name("Keys").unwrap().id;
     let original = instrument_state(&app, keys);
@@ -1421,34 +1650,11 @@ fn editor_gesture_polling_survives_discarded_and_hidden_host_iterations() {
     let latest = Rc::new(Cell::new(1u8));
     let polls = Rc::new(Cell::new(0));
     let captures = Rc::new(RefCell::new(Vec::new()));
-    let (poll_reports, poll_latest, poll_count, poll_captures) = (reports.clone(), latest.clone(), polls.clone(), captures.clone());
-    app.editor_poll_fixture = Some(Box::new(move |pending| {
-        poll_count.set(poll_count.get() + 1);
-        let edits = std::mem::take(&mut *poll_reports.borrow_mut());
-        super::editor_changes(
-            pending,
-            edits,
-            Vec::new(),
-            |_| false,
-            |due| {
-                poll_captures.borrow_mut().extend_from_slice(due);
-                due.iter().map(|&(track, slot)| (track, slot, vec![poll_latest.get(), 1])).collect()
-            },
-        )
-    }));
+    app.editor_poll_fixture = Some(poll_fixture(&reports, &latest, &polls, &captures));
     reports.borrow_mut().push((keys, soundcraft_mix::INSTRUMENT_SLOT, "cutoff".into(), 1.0));
     let mut input = raw();
     app.raw_input_hook(&ctx, &mut input);
-    let mut passes = 0;
-    let mut output = ctx.run_ui(input, |ui| {
-        app.logic(ui.ctx());
-        passes += 1;
-        if passes == 1 {
-            ui.ctx().request_discard("plugin gesture must survive a second layout pass");
-        }
-        app.ui(ui);
-    });
-    output.textures_delta.clear();
+    let passes = run_host_frame_discarding_first_pass(&mut app, &ctx, input);
     assert!(passes >= 2, "the regression must actually force a discarded pass");
     assert_eq!(polls.get(), 1, "the rerun cannot drain an empty editor queue");
     assert!(captures.borrow().is_empty(), "the ongoing gesture has not ended");
@@ -1490,8 +1696,19 @@ fn editor_gesture_polling_survives_discarded_and_hidden_host_iterations() {
     let _ = ctx.run_logic(&hidden, |ctx| app.logic(ctx));
     assert_eq!(polls.get(), 4, "a fresh empty host iteration is still live");
     assert_eq!(captures.borrow().len(), 1, "the completed gesture is captured once");
-    assert_eq!(app.engine.revision, settled_revision);
+    assert_history_unchanged(&app, settled_revision, undo, &history, &journal);
+}
+
+/// The engine's revision, undo history and journal are as they were.
+fn assert_history_unchanged(
+    app: &SoundApp,
+    revision: u64,
+    undo: usize,
+    history: &[String],
+    journal: &std::collections::VecDeque<(String, serde_json::Value)>,
+) {
+    assert_eq!(app.engine.revision, revision);
     assert_eq!(app.engine.undo_history().len(), undo);
     assert_eq!(app.engine.undo_history(), history);
-    assert_eq!(app.engine.journal, journal);
+    assert_eq!(&app.engine.journal, journal);
 }
