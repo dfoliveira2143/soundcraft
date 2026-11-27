@@ -15,14 +15,15 @@ fn strip_silence_dialog() -> (Harness<'static, SoundApp>, TrackId) {
     app.run("edit.select", json!({"tracks": [track.0], "start": 0, "end": end})).unwrap();
     menus::invoke_menu(&mut app, "edit.strip_silence", "Edit > Strip Silence");
     assert_eq!(app.dialogs.open_name(), Some("strip_silence"));
-    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
-        |ui, app: &mut SoundApp| {
-            let ctx = ui.ctx().clone();
-            app.logic(&ctx);
-            app.ui(ui);
-        },
-        app,
-    );
+    let mut h =
+        Harness::builder().with_context_setup(soundcraft_ui_egui::framework::install_headless).with_size(vec2(1600.0, 1000.0)).build_ui_state(
+            |ui, app: &mut SoundApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
     settle(&mut h);
     (h, track)
 }
@@ -108,4 +109,19 @@ fn the_rectangles_stay_while_rename_is_open_and_go_when_the_window_closes() {
     assert_eq!(h.state().dialogs.open_name(), None);
     assert_eq!(rectangles(&h), 0);
     assert_eq!(clips(&h, track), before);
+}
+
+#[test]
+fn closing_the_window_while_the_mix_window_shows_stops_the_scan() {
+    let (mut h, _) = strip_silence_dialog();
+    if let Some(Dialog::StripSilence { threshold, .. }) = &mut h.state_mut().dialogs.open {
+        *threshold = -30.0;
+    }
+    h.run_steps(1);
+    assert!(h.state().dialogs.strip_scan_running(), "a scan for the new threshold started");
+    h.state_mut().run("window.mix", json!({})).unwrap();
+    h.run_steps(2);
+    h.state_mut().dialogs.open = None;
+    h.run_steps(2);
+    assert!(!h.state().dialogs.strip_scan_running(), "the scan still runs after the window closed");
 }
